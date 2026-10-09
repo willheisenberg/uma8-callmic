@@ -190,13 +190,25 @@ Messen gegen das Roh-Array, gesamt und je Stufe (Vorverstärkung, Echounterdrüc
 
 ```sh
 python3 tools/latency_probe.py                    # 60 s, alle 10 s ein Wert je Stufe; dabei sprechen
-python3 tools/latency_probe.py --expect-max-ms 90 # als Prüfung: Exit 1, wenn der Median darüber liegt
+python3 tools/latency_probe.py --max-excess-ms 10 # Rückschrittprüfung: Exit 1, wenn der Ausgang >10 ms über dem Soll liegt
+python3 tools/latency_probe.py --expect-max-ms 90 # absolut: Exit 1, wenn der Median darüber liegt
 ```
 
 Ein pw-record-Stream nimmt alle Stufen im selben Graphzyklus auf, der Versatz zwischen den Spalten ist also die
-echte Latenz. Er fordert das Quantum eines Anrufs an (mit Echounterdrückung 480 Samples, sonst `clock.quantum`). Den Ausgang misst das Werkzeug über Pegelwechsel: währenddessen sprechen, Fenster mit Stille bleiben
+echte Latenz. Er fordert das Quantum eines Anrufs an (mit Echounterdrückung 480 Samples, sonst `clock.quantum`); PipeWire nimmt
+aber das kleinste Quantum aller aktiven Knoten. Deshalb liest er das tatsächliche Quantum nach dem Verbinden und
+am Ende aus `pw-top` und gibt es aus („unbekannt“, wenn es sich nicht ermitteln lässt). Den Ausgang misst das Werkzeug über Pegelwechsel: währenddessen sprechen, Fenster mit Stille bleiben
 leer. Der Ton bleibt im Speicher, ausgegeben werden nur Zahlen. Die Zusammenfassung zeigt die Abweichung vom Soll;
 positiv heißt zusätzlich gepuffert.
+
+Die absolute Gesamtlatenz hängt vom Aufbau ab. Die Echounterdrückung misst hier etwa 30 ms (Quantum 256, kabelgebundener
+Ausgang, Fedora mit webrtc-audio-processing 2.1; insgesamt etwa 86 ms), auf einem zweiten Aufbau (Arch mit
+webrtc-audio-processing 1.3) etwa 41 ms, bei gleichem Quantum und auch mit kabelgebundenem Ausgang; vermutlich liegt es
+an der WebRTC-Version (nicht gegengeprüft). PipeWire
+rundet das angeforderte 480 standardmäßig auf eine Zweierpotenz ab (256, `clock.power-of-two-quantum`). Als Rückschrittprüfung (etwa DeepFilterNet-Pufferwachstum)
+taugt darum `--max-excess-ms 10`: Es vergleicht den Ausgang mit dem Soll aus der gemessenen Echounterdrückung und ist
+vom Aufbau unabhängig. `--expect-max-ms` ist ein fester Wert für einen bekannten Aufbau. Exit: 0 in Ordnung,
+1 Schwelle überschritten oder nicht prüfbar, 2 Knoten fehlt oder Aufnahme scheitert.
 
 ## Tests
 
@@ -205,7 +217,7 @@ python -m pytest                                  # Unit-Tests
 cargo test --manifest-path plugin/Cargo.toml      # Rust-Tests
 python -m pytest -m integration                   # nach der Installation, braucht PipeWire
 python3 tools/check_output.py                     # mit angeschlossenem UMA-8
-python3 tools/latency_probe.py --expect-max-ms 90 # mit laufender Kette, dabei sprechen (siehe Latenz)
+python3 tools/latency_probe.py --max-excess-ms 10 # mit laufender Kette, dabei sprechen (siehe Latenz)
 ```
 
 Die RPM- und Arch-Bauten führen die Unit- und Rust-Tests beider Pakete ebenfalls aus (`%check`, `check()`), ohne

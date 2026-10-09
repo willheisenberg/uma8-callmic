@@ -3,7 +3,8 @@
 
     python3 tools/latency_probe.py                        # 60 s, alle 10 s ein Wert je Stufe
     python3 tools/latency_probe.py --seconds 600 --window 20
-    python3 tools/latency_probe.py --expect-max-ms 90     # als Prüfung: Exit 1, wenn der Median darüber liegt
+    python3 tools/latency_probe.py --max-excess-ms 10     # Rückschrittprüfung: Exit 1, wenn der Ausgang >10 ms über dem Soll liegt
+python3 tools/latency_probe.py --expect-max-ms 90     # absolut: Exit 1, wenn der Median darüber liegt
 
 Ein einziger pw-record-Stream (node.autoconnect = false) nimmt Mikrofon 0 der Raw-Quelle, AUX0 von
 Vorverstärkung und Echounterdrückung (nur wenn eingeschaltet) und den Ausgang „UMA-8 Call Mic“ auf, verbunden
@@ -17,7 +18,17 @@ Der Ton bleibt im Speicher; ausgegeben werden nur Zahlen, auf die Platte kommt n
 die Kette wie bei einem Anruf (auch die Echo-Referenz wird verbunden). Der Stream fordert das Quantum an, mit dem
 die Kette dabei läuft: mit Echounterdrückung deren node.latency (480 Samples), sonst clock.quantum (Standard 1024).
 pw-records Vorgabe von 100 ms höbe es sonst, wenn niemand anderes aufnimmt, auf bis zu 2048 oder 4096.
-Exit: 0 in Ordnung, 1 --expect-max-ms überschritten oder nicht prüfbar, 2 Knoten fehlt oder Aufnahme scheitert.
+Das ist nur die Anforderung: PipeWire nimmt das kleinste Quantum aller aktiven Knoten. Das tatsächliche Quantum
+des Treibers der Raw-Quelle liest das Werkzeug nach dem Verbinden und am Ende aus pw-top und gibt es aus.
+
+Die absolute Gesamtlatenz hängt vom Aufbau ab. Die Echounterdrückung misst hier etwa 30 ms (Quantum 256, kabelgebundener
+Ausgang, Fedora mit webrtc-audio-processing 2.1; insgesamt etwa 86 ms), auf einem zweiten Aufbau (Arch mit
+webrtc-audio-processing 1.3) etwa 41 ms, bei gleichem Quantum und auch mit kabelgebundenem Ausgang; vermutlich liegt es
+an der WebRTC-Version (nicht gegengeprüft). PipeWire
+rundet das angeforderte 480 standardmäßig auf eine Zweierpotenz ab (256, clock.power-of-two-quantum).
+Als Rückschrittprüfung taugt daher --max-excess-ms (Ausgang minus Soll mit gemessener Echounterdrückung), nicht
+der absolute --expect-max-ms.
+Exit: 0 in Ordnung, 1 Schwelle überschritten oder nicht prüfbar, 2 Knoten fehlt oder Aufnahme scheitert.
 """
 from __future__ import annotations
 
@@ -224,6 +235,43 @@ def call_quantum(objs: list[dict]) -> int:
     return DEFAULT_QUANTUM
 
 
+def parse_pw_top(text: str, node: str) -> int | None:
+    """Quantum des Treibers von `node` aus der letzten Ausgabe von `pw-top -b` (LC_ALL=C). Treiber zeigen ihr
+    Quantum in der Spalte QUANT; Folgeknoten haben dort 0 und den Namen „+ name“ hinter ihrem Treiber, dann zählt
+    die nächste Zeile darüber ohne „+“. Unbekannt (None): Knoten fehlt, Quantum 0 (läuft nicht)."""
+    rows: list[tuple[bool, int, str]] = []  # (Folgeknoten, QUANT, Name) der letzten Iteration
+    for line in text.splitlines():
+        t = line.split()
+        if len(t) >= 2 and t[1] == "ID":
+            rows = []  # neue Iteration: nur die letzte zählt
+        elif len(t) >= 4 and t[0] in "SIRCE!" and len(t[0]) == 1 and t[1].isdigit() and t[2].isdigit():
+            rows.append((t[-2] == "+", int(t[2]), t[-1]))
+    for i, (follower, quant, name) in enumerate(rows):
+        if name != node:
+            continue
+        if follower:
+            quant = next((q for f, q, _ in reversed(rows[:i]) if not f), 0)
+        return quant or None
+    return None
+
+
+def graph_quantum(node: str) -> int | None:
+    """Tatsächliches Quantum der Kette, in der `node` läuft (nur lesend: pw-top, ca. 1 s); None: unbekannt.
+    pw-dump nennt nur die angeforderte node.latency, nicht das aktuelle Quantum."""
+    try:
+        r = subprocess.run(["pw-top", "-b", "-n", "2"], capture_output=True, text=True, timeout=10,
+                           env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return parse_pw_top(r.stdout, node) if r.returncode == 0 else None
+
+
+def quantum_text(actual: int | None, requested: int) -> str:
+    if actual is None:
+        return f"Quantum unbekannt (angefordert {requested} Samples)"
+    return f"Quantum {actual} Samples ({actual * 1000 / SR:g} ms), angefordert {requested}"
+
+
 def discover() -> tuple[str, list[Stage], int]:
     """Nur lesend: pw-dump (Name der Raw-Quelle, ggf. mit Suffix; Quantum) und pw-link -o."""
     try:
@@ -264,8 +312,9 @@ def _wait(cap: Capture, frames: int, timeout: float) -> None:
 
 
 def measure(raw_port: str, stages: list[Stage], quantum: int, seconds: float, window: float,
-            max_lag: float) -> Iterator[tuple[float, list[Lag]]]:
-    """Nimmt auf und liefert je Fenster (Zeit in s, Versätze je Stufe). Der Ringpuffer hält nur max_lag + 2 Fenster."""
+            max_lag: float, quanta: list[int | None] | None = None) -> Iterator[tuple[float, list[Lag]]]:
+    """Nimmt auf und liefert je Fenster (Zeit in s, Versätze je Stufe). Der Ringpuffer hält nur max_lag + 2 Fenster.
+    Hängt das tatsächliche Quantum (graph_quantum) nach dem Verbinden und am Ende an `quanta` an."""
     node = f"uma8_latency_probe_{os.getpid()}"
     sources = [raw_port, *(st.port for st in stages)]
     inputs = [f"{node}:input_AUX{i}" for i in range(len(sources))]
@@ -282,6 +331,10 @@ def measure(raw_port: str, stages: list[Stage], quantum: int, seconds: float, wi
             link(src, dst)
         start = cap.total() + int(SETTLE_S * SR)
         _wait(cap, start, SETTLE_S + 10)
+        node_raw = raw_port.rpartition(":")[0]
+        if quanta is not None:
+            quanta.append(graph_quantum(node_raw))
+            print(quantum_text(quanta[-1], quantum), flush=True)
         for k in range(int((seconds * SR - lag_n) // win_n)):
             end = start + lag_n + (k + 1) * win_n
             _wait(cap, end, window + 10)
@@ -289,6 +342,8 @@ def measure(raw_port: str, stages: list[Stage], quantum: int, seconds: float, wi
             if seg is None:
                 raise ProbeError("Auswertung zu langsam, Ringpuffer überholt")
             yield (end - start) / SR, analyze(seg, stages, lag_n)
+        if quanta is not None:
+            quanta.append(graph_quantum(node_raw))
     finally:
         cap.close()
 
@@ -301,7 +356,8 @@ def cell(lag: Lag) -> str:
     return f"{lag.ms:7.1f} ms ({lag.strength:.2f})"
 
 
-def report(stages: list[Stage], rows: list[list[Lag]], expect_max_ms: float | None) -> int:
+def report(stages: list[Stage], rows: list[list[Lag]], expect_max_ms: float | None,
+           max_excess_ms: float | None = None) -> int:
     print("\nZusammenfassung (Median der gültigen Fenster, Spanne, Anzahl):")
     medians = {}
     for i, st in enumerate(stages):
@@ -323,16 +379,26 @@ def report(stages: list[Stage], rows: list[list[Lag]], expect_max_ms: float | No
         unit = K.SERVICE.removesuffix(".service")
         print(f"Abweichung des Ausgangs: {total - expected:+.1f} ms (positiv: zusätzlich gepuffert, z. B. "
               f"DeepFilterNet nach Underruns: journalctl --user -u {unit} | grep -i latency)")
-    if expect_max_ms is None:
+    if expect_max_ms is None and max_excess_ms is None:
         return 0
     if total is None:
         print("FEHLER: Gesamtlatenz nicht prüfbar, kein gültiges Fenster (Stille? Während der Messung sprechen)")
         return 1
-    if total > expect_max_ms:
-        print(f"FEHLER: Gesamtlatenz {total:.1f} ms über {expect_max_ms:g} ms")
-        return 1
-    print(f"OK: Gesamtlatenz {total:.1f} ms ≤ {expect_max_ms:g} ms")
-    return 0
+    rc = 0
+    if expect_max_ms is not None:
+        if total > expect_max_ms:
+            print(f"FEHLER: Gesamtlatenz {total:.1f} ms über {expect_max_ms:g} ms")
+            rc = 1
+        else:
+            print(f"OK: Gesamtlatenz {total:.1f} ms ≤ {expect_max_ms:g} ms")
+    if max_excess_ms is not None:
+        excess = total - expected
+        if excess > max_excess_ms:
+            print(f"FEHLER: Ausgang {excess:+.1f} ms über dem Soll, erlaubt {max_excess_ms:g} ms")
+            rc = 1
+        else:
+            print(f"OK: Ausgang {excess:+.1f} ms zum Soll ≤ {max_excess_ms:g} ms")
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -341,7 +407,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--window", type=float, default=10.0, help="ein Wert je Stufe alle S Sekunden (Standard 10)")
     ap.add_argument("--max-lag", type=float, default=5.0, help="größte gesuchte Latenz in s (Standard 5)")
     ap.add_argument("--expect-max-ms", type=float, metavar="MS",
-                    help="Exit 1, wenn der Median der Gesamtlatenz darüber liegt (oder nicht messbar ist)")
+                    help="Exit 1, wenn der Median der Gesamtlatenz darüber liegt (oder nicht messbar ist); "
+                         "absolut, hängt vom Aufbau ab (Quantum)")
+    ap.add_argument("--max-excess-ms", type=float, metavar="MS",
+                    help="Exit 1, wenn der Ausgang mehr als MS über dem Soll liegt (gemessene Echounterdrückung + "
+                         "Beamforming + DeepFilterNet + Begrenzer); Rückschrittprüfung, empfohlen: 10")
     args = ap.parse_args(argv)
     if args.window < 1 or args.max_lag <= 0:
         ap.error("--window mindestens 1 s, --max-lag größer 0")
@@ -354,7 +424,8 @@ def main(argv: list[str] | None = None) -> int:
     except ProbeError as e:
         print(f"Fehler: {e}", file=sys.stderr)
         return 2
-    print(f"Referenz: {raw_port}; Quantum {quantum} Samples ({quantum * 1000 / SR:g} ms) wie bei einem Anruf")
+    print(f"Referenz: {raw_port}; angefordertes Quantum {quantum} Samples ({quantum * 1000 / SR:g} ms) wie bei einem "
+          "Anruf; das tatsächliche wird nach dem Verbinden aus pw-top gelesen")
     for st in stages:
         print(f"  {st.label:<18} {st.port} ({'Hüllkurve' if st.envelope else 'Samples'})")
     if len(stages) == 1:
@@ -364,7 +435,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"{'Zeit':>7}  " + "".join(f"{st.label:>22}" for st in stages))
 
     rows: list[list[Lag]] = []
-    gen = measure(raw_port, stages, quantum, args.seconds, args.window, args.max_lag)
+    quanta: list[int | None] = []
+    gen = measure(raw_port, stages, quantum, args.seconds, args.window, args.max_lag, quanta)
     try:
         for t, lags in gen:
             rows.append(lags)
@@ -376,7 +448,12 @@ def main(argv: list[str] | None = None) -> int:
         print("abgebrochen")
     finally:
         gen.close()
-    return report(stages, rows, args.expect_max_ms)
+    if len(quanta) > 1 and quanta[-1] != quanta[0]:
+        print(f"Hinweis: Das Quantum hat sich während der Messung geändert: {quanta[0] or 'unbekannt'} → "
+              f"{quanta[-1] or 'unbekannt'}")
+    elif len(quanta) > 1:
+        print(f"Quantum am Ende unverändert: {quanta[-1] or 'unbekannt'}")
+    return report(stages, rows, args.expect_max_ms, args.max_excess_ms)
 
 
 if __name__ == "__main__":

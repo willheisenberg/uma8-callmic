@@ -157,3 +157,64 @@ def test_link_failures_are_probe_errors(monkeypatch, exc):
     monkeypatch.setattr(probe.subprocess, "run", fail)
     with pytest.raises(probe.ProbeError, match="pw-link a b"):
         probe.link("a", "b")
+
+
+DATA = Path(__file__).parent / "data"
+
+
+def test_parse_pw_top_real_output_uses_last_iteration():
+    text = (DATA / "pw_top_batch.txt").read_text()  # echte Ausgabe von LC_ALL=C pw-top -b -n 2
+    assert probe.parse_pw_top(text, "alsa_output.pci-0000_0f_00.4.analog-stereo") == 1024
+    # Folgeknoten (QUANT 0, „+ name“) übernehmen das Quantum ihres Treibers
+    assert probe.parse_pw_top(text, "mpv") == 1024
+    # Knoten ohne Quantum (nicht aktiv) und unbekannte Knoten: unbekannt
+    assert probe.parse_pw_top(text, "alsa_input.usb-miniDSP_micArray_RAW_SPK-00.analog-surround-71") is None
+    assert probe.parse_pw_top(text, "gibt-es-nicht") is None
+    assert probe.parse_pw_top("", "mpv") is None
+
+
+def test_parse_pw_top_driver_and_follower_rows():
+    head = "S   ID  QUANT   RATE    WAIT    BUSY   W/Q   B/Q  ERR FORMAT           NAME \n"
+    first = head + "R   99   1024  48000  1.0us  1.0us  0.00  0.00    0     S32LE 2 48000 raw\n"  # alte Iteration
+    # synthetisch nach dem echten Format: Treiber mit Quantum 256, Folgeknoten dahinter
+    last = (head
+            + "R  140    256  48000  9.0us  9.0us  0.00  0.00    0    S32LE 8 48000 alsa_input.raw\n"
+            + "R  300      0  48000  9.0us  9.0us  0.00  0.00    0    F32P 8 48000  + uma8_latency_probe_1\n"
+            + "R  137   1024  48000  9.0us  9.0us  0.00  0.00    0    S32LE 2 48000 alsa_output.x\n"
+            + "R  301      0  48000  9.0us  9.0us  0.00  0.00    0    F32P 2 48000  + follower\n")
+    assert probe.parse_pw_top(first + last, "alsa_input.raw") == 256
+    assert probe.parse_pw_top(first + last, "uma8_latency_probe_1") == 256
+    assert probe.parse_pw_top(first + last, "follower") == 1024
+    assert probe.parse_pw_top(first + last, "raw") is None  # nur die letzte Iteration zählt
+
+
+def test_graph_quantum_unknown_on_failure(monkeypatch):
+    def fail(*args, **kwargs):
+        raise FileNotFoundError("pw-top")
+    monkeypatch.setattr(probe.subprocess, "run", fail)
+    assert probe.graph_quantum("x") is None
+
+
+def test_quantum_text():
+    assert probe.quantum_text(256, 480) == "Quantum 256 Samples (5.33333 ms), angefordert 480"
+    assert "unbekannt" in probe.quantum_text(None, 480)
+
+
+def test_report_max_excess_is_setup_independent(capsys):
+    stages = [probe.Stage("Echounterdrückung", "a", False), probe.Stage("Ausgang", "o", True)]
+    ms = lambda v: probe.Lag(v * SR / 1000, 0.9)  # noqa: E731
+    fixed = (K.BEAM_LATENCY + K.DFN_LATENCY + K.LIMIT_LATENCY) * 1000 / SR
+
+    def rows(aec, out):
+        return [[ms(aec), ms(out)]] * 3
+
+    for aec in (30.0, 41.0):  # zwei Aufbauten: gemessene Echounterdrückung geht ins Soll ein
+        assert probe.report(stages, rows(aec, aec + fixed + 0.8), None, 10) == 0
+        assert probe.report(stages, rows(aec, aec + fixed + 10.5), None, 10) == 1
+    assert probe.report(stages, rows(41.0, 97.0), 90) == 1  # absolut scheitert, obwohl nichts falsch ist
+    assert probe.report(stages, rows(41.0, 97.0), 90, 10) == 1
+    assert probe.report(stages, rows(41.0, 97.0), None, 10) == 0
+    assert probe.report(stages, rows(30.0, 100.0), 120, 10) == 1  # beide Prüfungen gelten
+    silent = [[ms(10), probe.Lag(None, 0.0, "Stille")]]
+    assert probe.report(stages, silent, None, 10) == 1
+    assert "nicht prüfbar" in capsys.readouterr().out
